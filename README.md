@@ -1,5 +1,9 @@
 # prowl
 
+<p align="center">
+  <img src="assets/prowl.png" alt="Prowl" width="180" />
+</p>
+
 Bare metal native compiler for the [Sage language](https://github.com/sagelang/sage), built on LLVM.
 
 The main Sage compiler transpiles to Rust and lets `rustc` do the heavy lifting. Prowl skips the middleman — `.sg` source goes straight to native machine code via LLVM IR.
