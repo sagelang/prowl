@@ -14,7 +14,7 @@ hello.sg  →  prowl  →  LLVM IR  →  native binary
 
 ## Status
 
-Phases 1 & 2 complete. Scalar types, arithmetic, booleans, floats, functions, calls, and recursion all compile to native code. See `examples/` for working programs.
+Phases 1–3 complete. Scalar types, arithmetic, booleans, floats, functions, recursion, and control flow all compile to native code. See `examples/` for working programs.
 
 Use `--emit-ir` to inspect the generated LLVM IR:
 ```sh
@@ -44,10 +44,10 @@ prowl build hello.sg
 - [x] Return values
 - [x] Basic recursion
 
-### Phase 3 — Control flow
-- [ ] `if` / `else`
-- [ ] `while` loops
-- [ ] `loop` + `break`
+### Phase 3 — Control flow ✅
+- [x] `if` / `else`
+- [x] `while` loops
+- [x] `loop` + `break`
 - [ ] Pattern matching on scalars
 
 ### Phase 4 — Strings & I/O

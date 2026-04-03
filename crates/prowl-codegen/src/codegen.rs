@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use inkwell::{
     FloatPredicate, IntPredicate,
+    basic_block::BasicBlock,
     builder::Builder,
     context::Context,
     module::Module,
@@ -10,7 +11,7 @@ use inkwell::{
 };
 use sage_parser::{
     TypeExpr,
-    ast::{BinOp, Block, Expr, FnDecl, Literal, Program, Stmt, UnaryOp},
+    ast::{BinOp, Block, ElseBranch, Expr, FnDecl, Literal, Program, Stmt, UnaryOp},
 };
 
 /// Maps variable names to their alloca pointer and element type.
@@ -102,15 +103,14 @@ impl<'ctx> Codegen<'ctx> {
         let mut vars: Vars<'ctx> = HashMap::new();
 
         for (i, param) in f.params.iter().enumerate() {
-            let llvm_ty = self.basic_type(&param.ty)
+            let llvm_ty = self
+                .basic_type(&param.ty)
                 .expect("parameter type must be a non-void basic type");
             let alloca = self
                 .builder
                 .build_alloca(llvm_ty, &param.name.to_string())
                 .expect("alloca for param");
-            let param_val = function
-                .get_nth_param(i as u32)
-                .expect("param exists");
+            let param_val = function.get_nth_param(i as u32).expect("param exists");
             self.builder
                 .build_store(alloca, param_val)
                 .expect("store param");
@@ -122,9 +122,9 @@ impl<'ctx> Codegen<'ctx> {
             .build_unconditional_branch(body_bb)
             .expect("branch to body");
 
-        // Emit the function body.
+        // Emit the function body. No enclosing loop, so break_bb = None.
         self.builder.position_at_end(body_bb);
-        self.emit_block(&f.body, &mut vars);
+        self.emit_block(&f.body, &mut vars, None);
 
         // If control falls off the end without a `return`, emit a default terminator.
         // (The type checker should have caught missing returns, but LLVM requires every
@@ -155,23 +155,26 @@ impl<'ctx> Codegen<'ctx> {
     // Statements
     // =========================================================================
 
-    fn emit_block(&self, block: &Block, vars: &mut Vars<'ctx>) {
+    /// Emit all statements in a block.
+    ///
+    /// `break_bb` is the basic block to jump to on `break`, if we are inside
+    /// a loop.  It is `None` at function top-level.
+    fn emit_block(&self, block: &Block, vars: &mut Vars<'ctx>, break_bb: Option<BasicBlock<'ctx>>) {
         for stmt in &block.stmts {
-            // Stop emitting once the block is terminated (e.g. after a `return`).
             if self.is_terminated() {
                 break;
             }
-            self.emit_stmt(stmt, vars);
+            self.emit_stmt(stmt, vars, break_bb);
         }
     }
 
-    fn emit_stmt(&self, stmt: &Stmt, vars: &mut Vars<'ctx>) {
+    fn emit_stmt(&self, stmt: &Stmt, vars: &mut Vars<'ctx>, break_bb: Option<BasicBlock<'ctx>>) {
         match stmt {
             // let x: T = expr;
             Stmt::Let { name, ty, value, .. } => {
-                let val = self.emit_expr(value, vars)
+                let val = self
+                    .emit_expr(value, vars)
                     .expect("let binding value must not be void");
-                // Use the declared type if present, otherwise infer from value.
                 let llvm_ty = ty
                     .as_ref()
                     .and_then(|t| self.basic_type(t))
@@ -186,7 +189,8 @@ impl<'ctx> Codegen<'ctx> {
 
             // x = expr;
             Stmt::Assign { name, value, .. } => {
-                let val = self.emit_expr(value, vars)
+                let val = self
+                    .emit_expr(value, vars)
                     .expect("assignment value must not be void");
                 if let Some(&(ptr, _)) = vars.get(&name.to_string()) {
                     self.builder.build_store(ptr, val).expect("store assign");
@@ -194,17 +198,39 @@ impl<'ctx> Codegen<'ctx> {
             }
 
             // return expr?;
-            Stmt::Return { value, .. } => {
-                match value {
-                    Some(expr) => {
-                        let val = self.emit_expr(expr, vars)
-                            .expect("return value must not be void");
-                        self.builder.build_return(Some(&val)).expect("return");
-                    }
-                    None => {
-                        self.builder.build_return(None).expect("return void");
-                    }
+            Stmt::Return { value, .. } => match value {
+                Some(expr) => {
+                    let val = self
+                        .emit_expr(expr, vars)
+                        .expect("return value must not be void");
+                    self.builder.build_return(Some(&val)).expect("return");
                 }
+                None => {
+                    self.builder.build_return(None).expect("return void");
+                }
+            },
+
+            // if cond { ... } else { ... }
+            Stmt::If { condition, then_block, else_block, .. } => {
+                self.emit_if(condition, then_block, else_block.as_ref(), vars, break_bb);
+            }
+
+            // while cond { ... }
+            Stmt::While { condition, body, .. } => {
+                self.emit_while(condition, body, vars);
+            }
+
+            // loop { ... }
+            Stmt::Loop { body, .. } => {
+                self.emit_loop(body, vars);
+            }
+
+            // break;
+            Stmt::Break { .. } => {
+                let exit_bb = break_bb.expect("break outside of a loop");
+                self.builder
+                    .build_unconditional_branch(exit_bb)
+                    .expect("break branch");
             }
 
             // expr;  (value discarded)
@@ -217,6 +243,166 @@ impl<'ctx> Codegen<'ctx> {
                 let _ = other;
             }
         }
+    }
+
+    // =========================================================================
+    // Control flow
+    // =========================================================================
+
+    /// Emit an `if`/`else` statement.
+    ///
+    /// LLVM IR shape:
+    /// ```text
+    ///   br i1 %cond, label %then, label %else
+    /// then:
+    ///   ...
+    ///   br label %merge        ; only if not already terminated
+    /// else:
+    ///   ...
+    ///   br label %merge        ; only if not already terminated
+    /// merge:
+    ///   ...                    ; execution continues here
+    /// ```
+    fn emit_if(
+        &self,
+        condition: &Expr,
+        then_block: &Block,
+        else_branch: Option<&ElseBranch>,
+        vars: &mut Vars<'ctx>,
+        break_bb: Option<BasicBlock<'ctx>>,
+    ) {
+        let func = self.current_fn();
+        let then_bb  = self.context.append_basic_block(func, "then");
+        let else_bb  = self.context.append_basic_block(func, "else");
+        let merge_bb = self.context.append_basic_block(func, "merge");
+
+        // Emit the condition and branch.
+        let cond = self
+            .emit_expr(condition, vars)
+            .expect("if condition must be a value")
+            .into_int_value();
+        self.builder
+            .build_conditional_branch(cond, then_bb, else_bb)
+            .expect("cond branch");
+
+        // Emit the `then` branch.
+        self.builder.position_at_end(then_bb);
+        self.emit_block(then_block, vars, break_bb);
+        if !self.is_terminated() {
+            self.builder
+                .build_unconditional_branch(merge_bb)
+                .expect("then → merge");
+        }
+
+        // Emit the `else` branch (or just fall through to merge).
+        self.builder.position_at_end(else_bb);
+        match else_branch {
+            None => {
+                // No else clause — else block goes straight to merge.
+                self.builder
+                    .build_unconditional_branch(merge_bb)
+                    .expect("else → merge");
+            }
+            Some(ElseBranch::Block(block)) => {
+                self.emit_block(block, vars, break_bb);
+                if !self.is_terminated() {
+                    self.builder
+                        .build_unconditional_branch(merge_bb)
+                        .expect("else → merge");
+                }
+            }
+            Some(ElseBranch::ElseIf(stmt)) => {
+                // `else if` — emit the nested if directly into this block.
+                self.emit_stmt(stmt, vars, break_bb);
+                if !self.is_terminated() {
+                    self.builder
+                        .build_unconditional_branch(merge_bb)
+                        .expect("else-if → merge");
+                }
+            }
+        }
+
+        // Continue emitting after the if/else into the merge block.
+        self.builder.position_at_end(merge_bb);
+    }
+
+    /// Emit a `while` loop.
+    ///
+    /// LLVM IR shape:
+    /// ```text
+    ///   br label %cond
+    /// cond:
+    ///   %t = <condition>
+    ///   br i1 %t, label %body, label %exit
+    /// body:
+    ///   ...
+    ///   br label %cond         ; loop back (only if not terminated)
+    /// exit:
+    ///   ...                    ; execution continues here
+    /// ```
+    fn emit_while(&self, condition: &Expr, body: &Block, vars: &mut Vars<'ctx>) {
+        let func = self.current_fn();
+        let cond_bb = self.context.append_basic_block(func, "while_cond");
+        let body_bb = self.context.append_basic_block(func, "while_body");
+        let exit_bb = self.context.append_basic_block(func, "while_exit");
+
+        // Jump into the condition check.
+        self.builder
+            .build_unconditional_branch(cond_bb)
+            .expect("→ while_cond");
+
+        // Emit condition.
+        self.builder.position_at_end(cond_bb);
+        let cond = self
+            .emit_expr(condition, vars)
+            .expect("while condition must be a value")
+            .into_int_value();
+        self.builder
+            .build_conditional_branch(cond, body_bb, exit_bb)
+            .expect("while cond branch");
+
+        // Emit body. Pass exit_bb so `break` inside can jump out.
+        self.builder.position_at_end(body_bb);
+        self.emit_block(body, vars, Some(exit_bb));
+        if !self.is_terminated() {
+            self.builder
+                .build_unconditional_branch(cond_bb)
+                .expect("while_body → while_cond");
+        }
+
+        // Continue after the loop.
+        self.builder.position_at_end(exit_bb);
+    }
+
+    /// Emit an infinite `loop { ... }`.
+    ///
+    /// LLVM IR shape:
+    /// ```text
+    ///   br label %loop
+    /// loop:
+    ///   ...
+    ///   br label %loop         ; only if not terminated / broken
+    /// exit:
+    ///   ...                    ; reachable only via `break`
+    /// ```
+    fn emit_loop(&self, body: &Block, vars: &mut Vars<'ctx>) {
+        let func = self.current_fn();
+        let loop_bb = self.context.append_basic_block(func, "loop");
+        let exit_bb = self.context.append_basic_block(func, "loop_exit");
+
+        self.builder
+            .build_unconditional_branch(loop_bb)
+            .expect("→ loop");
+
+        self.builder.position_at_end(loop_bb);
+        self.emit_block(body, vars, Some(exit_bb));
+        if !self.is_terminated() {
+            self.builder
+                .build_unconditional_branch(loop_bb)
+                .expect("loop → loop");
+        }
+
+        self.builder.position_at_end(exit_bb);
     }
 
     // =========================================================================
@@ -233,7 +419,6 @@ impl<'ctx> Codegen<'ctx> {
                 let (ptr, ty) = vars
                     .get(&name.to_string())
                     .unwrap_or_else(|| panic!("undefined variable '{name}'"));
-                // emit: load <ty>, ptr %name
                 Some(
                     self.builder
                         .build_load(*ty, *ptr, &name.to_string())
@@ -245,83 +430,69 @@ impl<'ctx> Codegen<'ctx> {
                 Some(self.emit_binary(*op, left, right, vars))
             }
 
-            Expr::Unary { op, operand, .. } => {
-                Some(self.emit_unary(*op, operand, vars))
-            }
+            Expr::Unary { op, operand, .. } => Some(self.emit_unary(*op, operand, vars)),
 
-            Expr::Call { name, args, .. } => {
-                self.emit_call(&name.to_string(), args, vars)
-            }
+            Expr::Call { name, args, .. } => self.emit_call(&name.to_string(), args, vars),
 
-            // Parenthesised expression — just emit the inner value.
-            Expr::Paren { inner, .. } => {
-                self.emit_expr(inner, vars)
-            }
+            Expr::Paren { inner, .. } => self.emit_expr(inner, vars),
 
             other => {
-                panic!("expression not yet supported in Phase 1: {other:?}");
+                panic!("expression not yet supported: {other:?}");
             }
         }
     }
 
     fn emit_literal(&self, lit: &Literal) -> BasicValueEnum<'ctx> {
         match lit {
-            // Integer literal → i64 constant.
             Literal::Int(n) => self
                 .context
                 .i64_type()
-                .const_int(*n as u64, /* sign_extend */ true)
+                .const_int(*n as u64, true)
                 .into(),
-
-            // Float literal → f64 constant.
-            Literal::Float(f) => self
-                .context
-                .f64_type()
-                .const_float(*f)
-                .into(),
-
-            // Boolean literal → i1 constant (1 = true, 0 = false).
+            Literal::Float(f) => self.context.f64_type().const_float(*f).into(),
             Literal::Bool(b) => self
                 .context
                 .bool_type()
                 .const_int(*b as u64, false)
                 .into(),
-
-            Literal::String(_) => {
-                panic!("string literals are deferred to Phase 4")
-            }
+            Literal::String(_) => panic!("string literals are deferred to Phase 4"),
         }
     }
 
-    fn emit_binary(&self, op: BinOp, left: &Expr, right: &Expr, vars: &Vars<'ctx>) -> BasicValueEnum<'ctx> {
-        let lhs = self.emit_expr(left, vars).expect("binary lhs must have a value");
-        let rhs = self.emit_expr(right, vars).expect("binary rhs must have a value");
+    fn emit_binary(
+        &self,
+        op: BinOp,
+        left: &Expr,
+        right: &Expr,
+        vars: &Vars<'ctx>,
+    ) -> BasicValueEnum<'ctx> {
+        let lhs = self
+            .emit_expr(left, vars)
+            .expect("binary lhs must have a value");
+        let rhs = self
+            .emit_expr(right, vars)
+            .expect("binary rhs must have a value");
 
         if lhs.is_int_value() {
-            // Integer operations
             let l = lhs.into_int_value();
             let r = rhs.into_int_value();
             match op {
                 BinOp::Add => self.builder.build_int_add(l, r, "add").unwrap().into(),
                 BinOp::Sub => self.builder.build_int_sub(l, r, "sub").unwrap().into(),
                 BinOp::Mul => self.builder.build_int_mul(l, r, "mul").unwrap().into(),
-                // Signed division and remainder for Sage's Int (i64).
                 BinOp::Div => self.builder.build_int_signed_div(l, r, "div").unwrap().into(),
                 BinOp::Rem => self.builder.build_int_signed_rem(l, r, "rem").unwrap().into(),
-                // Comparisons produce i1 (bool).
                 BinOp::Eq  => self.builder.build_int_compare(IntPredicate::EQ,  l, r, "eq").unwrap().into(),
                 BinOp::Ne  => self.builder.build_int_compare(IntPredicate::NE,  l, r, "ne").unwrap().into(),
                 BinOp::Lt  => self.builder.build_int_compare(IntPredicate::SLT, l, r, "lt").unwrap().into(),
                 BinOp::Gt  => self.builder.build_int_compare(IntPredicate::SGT, l, r, "gt").unwrap().into(),
                 BinOp::Le  => self.builder.build_int_compare(IntPredicate::SLE, l, r, "le").unwrap().into(),
                 BinOp::Ge  => self.builder.build_int_compare(IntPredicate::SGE, l, r, "ge").unwrap().into(),
-                // Logical and/or on i1 (booleans are also ints in LLVM).
                 BinOp::And => self.builder.build_and(l, r, "and").unwrap().into(),
                 BinOp::Or  => self.builder.build_or(l, r, "or").unwrap().into(),
                 BinOp::Concat => panic!("string concatenation deferred to Phase 4"),
             }
         } else if lhs.is_float_value() {
-            // Float operations
             let l = lhs.into_float_value();
             let r = rhs.into_float_value();
             match op {
@@ -330,7 +501,6 @@ impl<'ctx> Codegen<'ctx> {
                 BinOp::Mul => self.builder.build_float_mul(l, r, "fmul").unwrap().into(),
                 BinOp::Div => self.builder.build_float_div(l, r, "fdiv").unwrap().into(),
                 BinOp::Rem => self.builder.build_float_rem(l, r, "frem").unwrap().into(),
-                // Ordered comparisons (OEQ etc.) return false if either operand is NaN.
                 BinOp::Eq  => self.builder.build_float_compare(FloatPredicate::OEQ, l, r, "feq").unwrap().into(),
                 BinOp::Ne  => self.builder.build_float_compare(FloatPredicate::ONE, l, r, "fne").unwrap().into(),
                 BinOp::Lt  => self.builder.build_float_compare(FloatPredicate::OLT, l, r, "flt").unwrap().into(),
@@ -340,30 +510,42 @@ impl<'ctx> Codegen<'ctx> {
                 op => panic!("operator {op:?} not valid for floats"),
             }
         } else {
-            panic!("unsupported operand types for binary op in Phase 1");
+            panic!("unsupported operand types for binary op");
         }
     }
 
     fn emit_unary(&self, op: UnaryOp, operand: &Expr, vars: &Vars<'ctx>) -> BasicValueEnum<'ctx> {
-        let val = self.emit_expr(operand, vars).expect("unary operand must have a value");
+        let val = self
+            .emit_expr(operand, vars)
+            .expect("unary operand must have a value");
         match op {
             UnaryOp::Neg => {
                 if val.is_int_value() {
-                    // emit: sub i64 0, %val
-                    self.builder.build_int_neg(val.into_int_value(), "neg").unwrap().into()
+                    self.builder
+                        .build_int_neg(val.into_int_value(), "neg")
+                        .unwrap()
+                        .into()
                 } else {
-                    // emit: fneg double %val
-                    self.builder.build_float_neg(val.into_float_value(), "fneg").unwrap().into()
+                    self.builder
+                        .build_float_neg(val.into_float_value(), "fneg")
+                        .unwrap()
+                        .into()
                 }
             }
-            UnaryOp::Not => {
-                // emit: xor i1 %val, true
-                self.builder.build_not(val.into_int_value(), "not").unwrap().into()
-            }
+            UnaryOp::Not => self
+                .builder
+                .build_not(val.into_int_value(), "not")
+                .unwrap()
+                .into(),
         }
     }
 
-    fn emit_call(&self, name: &str, args: &[Expr], vars: &Vars<'ctx>) -> Option<BasicValueEnum<'ctx>> {
+    fn emit_call(
+        &self,
+        name: &str,
+        args: &[Expr],
+        vars: &Vars<'ctx>,
+    ) -> Option<BasicValueEnum<'ctx>> {
         let mangled = Self::mangle(name);
         let function = self
             .module
@@ -384,7 +566,6 @@ impl<'ctx> Codegen<'ctx> {
             .build_call(function, &arg_vals, name)
             .expect("build_call");
 
-        // `try_as_basic_value` returns ValueKind::Basic(v) for non-void calls.
         call.try_as_basic_value().basic()
     }
 
@@ -392,11 +573,6 @@ impl<'ctx> Codegen<'ctx> {
     // C `main` entry point
     // =========================================================================
 
-    /// Emit the `main` function the OS calls.
-    ///
-    /// If the program declares a no-argument function whose name matches the
-    /// `run` directive (or is literally called `main`), we call it and forward
-    /// its return value as the exit code.  Otherwise we return 0.
     fn emit_c_main(&self, program: &Program) {
         let i32_type = self.context.i32_type();
         let main_fn = self
@@ -429,12 +605,13 @@ impl<'ctx> Codegen<'ctx> {
 
             match call.try_as_basic_value().basic() {
                 Some(v) if v.is_int_value() => {
-                    // Truncate i64 → i32 for the OS exit code.
                     let i32_val = self
                         .builder
                         .build_int_truncate(v.into_int_value(), i32_type, "exit_code")
                         .expect("truncate to i32");
-                    self.builder.build_return(Some(&i32_val)).expect("return exit code");
+                    self.builder
+                        .build_return(Some(&i32_val))
+                        .expect("return exit code");
                 }
                 _ => {
                     self.builder
@@ -453,8 +630,6 @@ impl<'ctx> Codegen<'ctx> {
     // Type helpers
     // =========================================================================
 
-    /// Map a Sage type to an LLVM `BasicTypeEnum`.
-    /// Returns `None` for `Unit` (which maps to LLVM `void`).
     pub fn basic_type(&self, ty: &TypeExpr) -> Option<BasicTypeEnum<'ctx>> {
         match ty {
             TypeExpr::Int   => Some(self.context.i64_type().into()),
@@ -465,8 +640,6 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Same as `basic_type` but returns `BasicMetadataTypeEnum` for use in
-    /// function parameter lists.
     fn basic_metadata_type(&self, ty: &TypeExpr) -> Option<BasicMetadataTypeEnum<'ctx>> {
         match ty {
             TypeExpr::Int   => Some(self.context.i64_type().into()),
@@ -481,8 +654,16 @@ impl<'ctx> Codegen<'ctx> {
     // Utilities
     // =========================================================================
 
-    /// Returns true if the current basic block already has a terminator
-    /// instruction (ret, br, etc.) and we should stop emitting into it.
+    /// Returns the function currently being built.
+    fn current_fn(&self) -> FunctionValue<'ctx> {
+        self.builder
+            .get_insert_block()
+            .expect("no active basic block")
+            .get_parent()
+            .expect("basic block has no parent function")
+    }
+
+    /// Returns true if the current basic block already has a terminator.
     fn is_terminated(&self) -> bool {
         self.builder
             .get_insert_block()
