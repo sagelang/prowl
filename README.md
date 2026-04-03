@@ -64,16 +64,22 @@ prowl build hello.sg
 - [ ] Supervision trees
 
 ### Phase 8 — LLM & tools
-- [ ] `divine` (LLM inference) via Rust or C FFI
-- [ ] Built-in tools (Http, Fs, Shell)
-- [ ] MCP client
+- [ ] `prowl-runtime` — Rust static library linked into every compiled binary
+- [ ] `divine` (LLM inference) via Rust FFI into `prowl-runtime`
+- [ ] Built-in tools (Http, Fs, Shell) via Rust FFI
+- [ ] MCP client via Rust FFI
 
 ## Architecture
 
 ```
 crates/
 ├── prowl/           # CLI binary (prowl build <file.sg>)
-└── prowl-codegen/   # LLVM IR emission via inkwell
+├── prowl-codegen/   # LLVM IR emission via inkwell
+└── prowl-runtime/   # Rust static lib linked into compiled binaries (phase 8)
 ```
 
 Prowl reuses [`sage-parser`](https://crates.io/crates/sage-parser) and [`sage-checker`](https://crates.io/crates/sage-checker) from the main Sage toolchain. Only the backend is new.
+
+### Runtime FFI model
+
+Rather than reimplementing LLM inference, HTTP, and other capabilities in raw LLVM IR, prowl will ship a `prowl-runtime` Rust static library. The compiler emits `extern` function declarations for runtime calls, and links the compiled object against `prowl-runtime` at the end of the build. This gives bare metal codegen without giving up Rust's ecosystem for the hard parts.
