@@ -253,6 +253,11 @@ impl<'ctx> Codegen<'ctx> {
                 self.emit_call(&name.to_string(), args, vars)
             }
 
+            // Parenthesised expression — just emit the inner value.
+            Expr::Paren { inner, .. } => {
+                self.emit_expr(inner, vars)
+            }
+
             other => {
                 panic!("expression not yet supported in Phase 1: {other:?}");
             }

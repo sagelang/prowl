@@ -14,7 +14,12 @@ hello.sg  →  prowl  →  LLVM IR  →  native binary
 
 ## Status
 
-Early stage. The pipeline is wired end-to-end (parse → type check → LLVM codegen → link), but codegen currently emits a stub `main`. The roadmap below tracks what's next.
+Phases 1 & 2 complete. Scalar types, arithmetic, booleans, floats, functions, calls, and recursion all compile to native code. See `examples/` for working programs.
+
+Use `--emit-ir` to inspect the generated LLVM IR:
+```sh
+prowl build examples/arithmetic.sg --emit-ir
+```
 
 ## Usage
 
@@ -27,17 +32,17 @@ prowl build hello.sg
 
 ## Roadmap
 
-### Phase 1 — Scalar types & arithmetic
-- [ ] Integer literals → LLVM `i64` constants
-- [ ] Arithmetic expressions (`+`, `-`, `*`, `/`, `%`)
-- [ ] Boolean literals & logical operators
-- [ ] Float literals → `f64`
+### Phase 1 — Scalar types & arithmetic ✅
+- [x] Integer literals → LLVM `i64` constants
+- [x] Arithmetic expressions (`+`, `-`, `*`, `/`, `%`)
+- [x] Boolean literals & logical operators
+- [x] Float literals → `f64`
 
-### Phase 2 — Functions
-- [ ] Top-level `fn` declarations
-- [ ] Function calls
-- [ ] Return values
-- [ ] Basic recursion
+### Phase 2 — Functions ✅
+- [x] Top-level `fn` declarations
+- [x] Function calls
+- [x] Return values
+- [x] Basic recursion
 
 ### Phase 3 — Control flow
 - [ ] `if` / `else`

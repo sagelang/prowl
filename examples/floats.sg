@@ -1,0 +1,19 @@
+// Floating point arithmetic.
+// Computes the area of a circle with radius 5 and returns 0.
+// (Validating float results against expected values needs Phase 3 type casts.)
+
+fn circle_area(r: Float) -> Float {
+    let pi: Float = 3.14159265358979;
+    return pi * r * r;
+}
+
+fn scale(x: Float, factor: Float) -> Float {
+    return x * factor;
+}
+
+fn main() -> Int {
+    let area: Float = circle_area(5.0);
+    let scaled: Float = scale(area, 2.0);
+    let _ = scaled;
+    return 0;
+}

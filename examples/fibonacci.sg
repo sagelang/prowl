@@ -1,0 +1,13 @@
+// Recursive Fibonacci.
+// Returns fib(10) = 55 as the exit code.
+
+fn fib(n: Int) -> Int {
+    if n <= 1 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() -> Int {
+    return fib(10);
+}

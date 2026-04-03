@@ -1,0 +1,9 @@
+// Basic arithmetic — addition, subtraction, multiplication, division.
+// Returns the result of (10 + 5) * 2 - 8 / 4 = 28 as the exit code.
+
+fn main() -> Int {
+    let a: Int = 10 + 5;
+    let b: Int = a * 2;
+    let c: Int = 8 / 4;
+    return b - c;
+}
