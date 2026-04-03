@@ -64,7 +64,7 @@ prowl build hello.sg
 - [ ] Supervision trees
 
 ### Phase 8 — LLM & tools
-- [ ] `divine` (LLM inference) via C FFI
+- [ ] `divine` (LLM inference) via Rust or C FFI
 - [ ] Built-in tools (Http, Fs, Shell)
 - [ ] MCP client
 
