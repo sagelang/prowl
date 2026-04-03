@@ -1,0 +1,18 @@
+[package]
+name = "prowl"
+description = "Prowl — bare metal native compiler for the Sage language"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "prowl"
+path = "src/main.rs"
+
+[dependencies]
+prowl-codegen = { path = "../prowl-codegen" }
+sage-parser.workspace = true
+sage-checker.workspace = true
+clap.workspace = true
+miette.workspace = true
